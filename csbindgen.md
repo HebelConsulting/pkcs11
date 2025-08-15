@@ -12,14 +12,14 @@ However, there are still situations where you should use native code while prima
 - When you want to use a native library written in C
 - When you want to avoid using runtime libraries, for example, writing native network code in Unity to avoid .NET’s Socket (in Unity, the .NET runtime is old, making it difficult to achieve good performance)
 
-The first choice for creating native code is, of course, C++, but C++ builds are extremely complex. That’s why I chose <u>Rust</u>. With libraries like the cc crate and cmake crate, C and C++ code can be naturally integrated into Rust’s build system, and automatic binding generation using bindgen is very stable. The development environment is well-equipped, and the command system is modern. Cross-platform builds are easy! It’s a great language.
+The first choice for creating native code is, of course, C++, but C++ builds are extremely complex. That’s why I chose [Rust](https://www.rust-lang.org/). With libraries like the [cc crate](https://crates.io/crates/cc) and [cmake crate](https://crates.io/crates/cmake), C and C++ code can be naturally integrated into Rust’s build system, and automatic binding generation using [bindgen](https://github.com/rust-lang/rust-bindgen) is very stable. The development environment is well-equipped, and the command system is modern. Cross-platform builds are easy! It’s a great language.
 
+However, integrating Rust code with C# requires an extra step. While there are tools like [SWIG](https://www.swig.org/), [ClangSharpPInvokeGenerator](https://github.com/dotnet/ClangSharp) and [CppSharp](https://github.com/mono/CppSharp) for automating DllImport, the idea of directly converting regular C++ code often results in incomplete or complex generated code, which is not ideal.
 
+Csbindgen delegates the handling of complex C (C++) code to Rust’s bindgen. By having bindgen clean up the code into beautiful Rust and targeting only FFI-optimized Rust code for analysis, we ensure accuracy and simplicity of the generated code. When writing native code yourself, Rust warns you if you try to expose FFI-incompatible types, which inevitably results in clean and easy-to-generate code. Rust’s type system is also very organized, making it easier to map to C#. In recent years, C# has added features like nint, delegate*, and [CLong](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.clong) (from .NET 6) that enable more natural interactions. Csbindgen leverages these latest language features to generate natural, high-performance binding code.
 
-
-
-
-
+## Getting Started
+To get started, simply add the build-time dependency to your config and insert the settings in `build.rs`, a pre-compile call (Rust's ability to write pre-build code and add build-time dependencies is excellent).
 
 
 
