@@ -306,6 +306,279 @@ NativeMethods.delete_counter_context(ctx);
 
 ## Marshaling Strings and Arrays
 
+Strings and arrays have different structures in C# and Rust, so they cannot be directly exchanged. You can only exchange pointers and lengths, which are Spans in C#. If you only need to process Spans, it’s zero-copy. However, if you want to convert to a string or an array, you will need to allocate memory on both the C# and Rust sides. This is a drawback of introducing native code, as pure C# is more flexible (or may be advantageous in terms of performance). Anyway, the basic idea is to use Spans. You should not accept strings or arrays in DllImport; instead, manage the allocations explicitly without relying on automatic conversions.
+
+Now, let’s talk about strings. There are three types of strings to be exchanged in such cases: UTF8, UTF16, and null-terminated strings. UTF8 corresponds to Rust’s strings (Rust’s String is Vec<u8>), C#’s strings are UTF16, and C libraries may return null-terminated strings.
+
+For this example, we will explicitly return a null-terminated string in Rust.
+
+```rust
+#[no_mangle]
+pub extern "C" fn alloc_c_string() -> *mut c_char {
+    let str = CString::new("foo bar baz").unwrap();
+    str.into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_c_string(str: *mut c_char) {
+    unsafe { CString::from_raw(str) };
+}
+```
+
+```csharp
+// null-terminated `byte*` or sbyte* can materialize by new String()
+var cString = NativeMethods.alloc_c_string();
+var str = new String((sbyte*)cString);
+NativeMethods.free_c_string(cString);
+```
+
+In C#, you can create a string by passing a pointer (sbyte*) to the new String, which will find the null terminator and create a string for you. In this case, the pointer is memory allocated in Rust, so once you’ve copied it onto the C# heap (created a new String), you should return it immediately.
+
+Allocating UTF8, byte[], or int[] arrays in Rust and passing them to C# is a bit more complicated. When passing an array-like object (Vec<T>) from Rust to C#, it’s okay to pass a pointer and length, but this alone is not enough for deallocating memory. The actual Vec<T> consists of a pointer, length, and capacity, so you need to pass these three pieces of information. Processing these three pieces of information every time can be cumbersome, as there are tasks such as removing and returning Rust-like memory management.
+
+To handle this, let’s prepare a slightly longer utility, as shown below. The original code for this utility comes from Mozilla, the (former) developer of Rust.
+
+```rust
+#[repr(C)]
+pub struct ByteBuffer {
+    ptr: *mut u8,
+    length: i32,
+    capacity: i32,
+}
+
+impl ByteBuffer {
+    pub fn len(&self) -> usize {
+        self.length.try_into().expect("buffer length negative or overflowed")
+    }
+
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        let length = i32::try_from(bytes.len()).expect("buffer length cannot fit into a i32.");
+        let capacity = i32::try_from(bytes.capacity()).expect("buffer capacity cannot fit into a i32.");
+
+        // keep memory until call delete
+        let mut v = std::mem::ManuallyDrop::new(bytes);
+
+        Self {
+            ptr: v.as_mut_ptr(),
+            length,
+            capacity,
+        }
+    }
+
+    pub fn from_vec_struct<T: Sized>(bytes: Vec<T>) -> Self {
+        let element_size = std::mem::size_of::<T>() as i32;
+
+        let length = (bytes.len() as i32) * element_size;
+        let capacity = (bytes.capacity() as i32) * element_size;
+
+        let mut v = std::mem::ManuallyDrop::new(bytes);
+
+        Self {
+            ptr: v.as_mut_ptr() as *mut u8,
+            length,
+            capacity,
+        }
+    }
+
+    pub fn destroy_into_vec(self) -> Vec<u8> {
+        if self.ptr.is_null() {
+            vec![]
+        } else {
+            let capacity: usize = self.capacity.try_into().expect("buffer capacity negative or overflowed");
+            let length: usize = self.length.try_into().expect("buffer length negative or overflowed");
+
+            unsafe { Vec::from_raw_parts(self.ptr, length, capacity) }
+        }
+    }
+
+    pub fn destroy_into_vec_struct<T: Sized>(self) -> Vec<T> {
+        if self.ptr.is_null() {
+            vec![]
+        } else {
+            let element_size = std::mem::size_of::<T>() as i32;
+            let length = (self.length * element_size) as usize;
+            let capacity = (self.capacity * element_size) as usize;
+
+            unsafe { Vec::from_raw_parts(self.ptr as *mut T, length, capacity) }
+        }
+    }
+
+    pub fn destroy(self) {
+        drop(self.destroy_into_vec());
+    }
+}
+```
+
+This utility works like the Vec version of Box::into_raw/from_raw, removing memory management when calling from_vec and returning memory management to the caller when calling destroy_into_vec (it will be destroyed when the scope is exited if nothing is done). This definition is also generated on the C# side (by csbindgen), so you can add methods to it.
+
+```csharp
+// C# side span utility
+partial struct ByteBuffer
+{
+    public unsafe Span<byte> AsSpan()
+    {
+        return new Span<byte>(ptr, length);
+    }
+
+    public unsafe Span<T> AsSpan<T>()
+    {
+        return MemoryMarshal.CreateSpan(ref Unsafe.AsRef<T>(ptr), length / Unsafe.SizeOf<T>());
+    }
+}
+```
+
+Now, you can instantly convert what you’ve received as ByteBuffer* to Span! Let’s take a look at examples of regular strings, byte[], and int[] in Rust.
+
+```rust
+#[no_mangle]
+pub extern "C" fn alloc_u8_string() -> *mut ByteBuffer {
+    let str = format!("foo bar baz");
+    let buf = ByteBuffer::from_vec(str.into_bytes());
+    Box::into_raw(Box::new(buf))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_u8_string(buffer: *mut ByteBuffer) {
+    let buf = Box::from_raw(buffer);
+    // drop inner buffer, if you need String, use String::from_utf8_unchecked(buf.destroy_into_vec()) instead.
+    buf.destroy();
+}
+
+#[no_mangle]
+pub extern "C" fn alloc_u8_buffer() -> *mut ByteBuffer {
+    let vec: Vec<u8> = vec![1, 10, 100];
+    let buf = ByteBuffer::from_vec(vec);
+    Box::into_raw(Box::new(buf))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_u8_buffer(buffer: *mut ByteBuffer) {
+    let buf = Box::from_raw(buffer);
+    // drop inner buffer, if you need Vec<u8>, use buf.destroy_into_vec() instead.
+    buf.destroy();
+}
+
+#[no_mangle]
+pub extern "C" fn alloc_i32_buffer() -> *mut ByteBuffer {
+    let vec: Vec<i32> = vec![1, 10, 100, 1000, 10000];
+    let buf = ByteBuffer::from_vec_struct(vec);
+    Box::into_raw(Box::new(buf))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_i32_buffer(buffer: *mut ByteBuffer) {
+    let buf = Box::from_raw(buffer);
+    // drop inner buffer, if you need Vec<i32>, use buf.destroy_into_vec_struct::<i32>() instead.
+    buf.destroy();
+}
+```
+
+It can be confusing to have nested management, such as the need to remove the management of ByteBuffer itself (into_raw) and the need to destroy or into_vec the contents of the ByteBuffer after returning it with from_raw. There is room for improvement in the cleanup side of the process by implementing the Drop trait.
+
+On the C# side, you can simply use AsSpan and use it as you like.
+
+```csharp
+var u8String = NativeMethods.alloc_u8_string();
+var u8Buffer = NativeMethods.alloc_u8_buffer();
+var i32Buffer = NativeMethods.alloc_i32_buffer();
+try
+{
+    var str = Encoding.UTF8.GetString(u8String->AsSpan());
+    Console.WriteLine(str);
+
+    Console.WriteLine("----");
+
+    var buffer = u8Buffer->AsSpan();
+    foreach (var item in buffer)
+    {
+        Console.WriteLine(item);
+    }
+
+    Console.WriteLine("----");
+
+    var i32Span = i32Buffer->AsSpan<int>();
+    foreach (var item in i32Span)
+    {
+        Console.WriteLine(item);
+    }
+}
+finally
+{
+    NativeMethods.free_u8_string(u8String);
+    NativeMethods.free_u8_buffer(u8Buffer);
+    NativeMethods.free_i32_buffer(i32Buffer);
+}
+```
+
+Let’s remain faithful to the basic principle that memory allocated in Rust should be released in Rust. In this example, you might want the memory to be released automatically once it’s been processed on the C# side. However, there are cases where you want to keep the memory for a longer lifespan, so let’s release it manually. Implicit allocations are the number one enemy of performance.
+
+Finally, here’s an example of using memory allocated in C# on the Rust side.
+
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn csharp_to_rust_string(utf16_str: *const u16, utf16_len: i32) {
+    let slice = std::slice::from_raw_parts(utf16_str, utf16_len as usize);
+    let str = String::from_utf16(slice).unwrap();
+    println!("{}", str);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn csharp_to_rust_utf8(utf8_str: *const u8, utf8_len: i32) {
+    let slice = std::slice::from_raw_parts(utf8_str, utf8_len as usize);
+    let str = String::from_utf8_unchecked(slice.to_vec());
+    println!("{}", str);
+}
+
+
+#[no_mangle]
+pub unsafe extern "C" fn csharp_to_rust_bytes(bytes: *const u8, len: i32) {
+    let slice = std::slice::from_raw_parts(bytes, len as usize);
+    let vec = slice.to_vec();
+    println!("{:?}", vec);
+}
+```
+
+```csharp
+var str = "foobarbaz:あいうえお"; // JPN(Unicode)
+fixed (char* p = str)
+{
+    NativeMethods.csharp_to_rust_string((ushort*)p, str.Length);
+}
+
+var str2 = Encoding.UTF8.GetBytes("あいうえお:foobarbaz");
+fixed (byte* p = str2)
+{
+    NativeMethods.csharp_to_rust_utf8(p, str2.Length);
+}
+
+var bytes = new byte[] { 1, 10, 100, 255 };
+fixed (byte* p = bytes)
+{
+    NativeMethods.csharp_to_rust_bytes(p, bytes.Length);
+}
+```
+
+You create a Slice using std::slice::from_raw_parts and then process it as needed. If you want to maintain a longer lifespan beyond a single function, copying (creating a String, Vec, etc.) is essential. Just as it is important to release memory allocated in Rust on the Rust side, it is important to release memory allocated in C# on the C# side. In the case of C#, if you don’t have a reference after exiting the fixed scope, the GC will eventually handle it.
+
+If you want to maintain a longer lifespan in C# beyond the fixed scope, you can use GCHandle.Alloc(obj, GCHandleType.Pinned) to carry it around.
+
+## Conclusion
+
+The [csbindgen]() ReadMe introduces many more conversion patterns, so be sure to check it out as well.
+
+Bringing in C libraries has become overwhelmingly easier, which has changed my way of thinking a bit. Until now, I was more of a Pure C# implementation purist, but now I’ve learned to think about clever divisions and distinctions in usage. And as using C libraries becomes more flexible, it’s another step towards realizing [Cysharp](http://cysharp.com/)‘s mission of “unlocking the possibilities of C#”.
+
+We have plans to provide several C# libraries utilizing csbindgen soon! However, before that, I’d be delighted if you could give csbindgen a try, even if you’ve never used Rust before.
+
+
+
+
+
+
+
+
+
+
 
 
 
