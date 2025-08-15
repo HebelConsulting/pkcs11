@@ -1,2 +1,6 @@
 # macos
 .DS_Store
+
+# Cargo build system
+Cargo.lock
+target/
