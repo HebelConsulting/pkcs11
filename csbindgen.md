@@ -149,11 +149,162 @@ extern "C" fn sum(x:i32, y:i32) -> i32 {
 }
 ```
 
+Upon receiving a C# method, the simple method will either just read and display it using println or pass an addition function back to C#. The generated code will look like this:
+
+```csharp
+[DllImport(__DllName, EntryPoint = "csharp_to_rust", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+public static extern void csharp_to_rust(delegate* unmanaged[Cdecl]<int, int, int> cb);
+
+[DllImport(__DllName, EntryPoint = "rust_to_csharp", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+public static extern delegate* unmanaged[Cdecl]<int, int, int> rust_to_csharp();
+```
+
+`delegate* unmanaged[Cdecl]<int, int, int>` might be an unfamiliar definition, but it is a true function pointer added in C# 9.0. Although manually writing the definition is a bit complicated, it is automatically generated, so there is no need to write it by hand. The usability is quite good and can be treated like a regular static method.
+
+```csharp
+// C# to Native, require UnmanagedCallersOnly
+[UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+static int Sum(int x, int y) => x + y;
+
+// pass function pointer by `&`
+NativeMethods.csharp_to_rust(&Sum);
+
+// receive delegate* from Rust
+var f = NativeMethods.rust_to_csharp();
+
+// received function pointer can invoke naturally
+var v = f(20, 30);
+Console.WriteLine(v); // 50
+```
+
+If you want to pass around state, you can prepare code that takes a context (void*) as the first argument.
+
+By the way, Unity supports C# 9.0 and function pointers can be used, but [extensible calling conventions for unmanaged function pointers is not supported](https://docs.unity3d.com/Manual/CSharpCompiler.html). UnmanagedCallersOnlyAttribute is also missing. In particular, it does not work at all with IL2CPP, so special measures are needed. By setting the csharp_use_function_pointer(false) option in csbindgen, it will output code using the traditional delegate.
+
+```csharp
+// csharp_use_function_pointer(false) generates dedicated delegate
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+public delegate int csharp_to_rust_cb_delegate(int x, int y);
+
+[DllImport(__DllName, EntryPoint = "csharp_to_rust", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+public static extern void csharp_to_rust(csharp_to_rust_cb_delegate cb);
+
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+public delegate int rust_to_csharp_return_delegate(int x, int y);
+
+[DllImport(__DllName, EntryPoint = "rust_to_csharp", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+public static extern rust_to_csharp_return_delegate rust_to_csharp();
+
+// require MonoPInvokeCallback(setup delegate type by typeof)
+[MonoPInvokeCallback(typeof(NativeMethods.csharp_to_rust_cb_delegate))]
+static int Sum(int x, int y) => x + y;
+
+// pass directly
+NativeMethods.csharp_to_rust(Method);
+
+// received function pointer(delegate) is same as .NET
+var f = NativeMethods.rust_to_csharp();
+var v = f(20, 30);
+Console.WriteLine(v); // 50
+```
+
+Csbindgen also outputs dedicated delegates simultaneously, making the definition much easier. The only difference between .NET and Unity that needs to be considered is the attribute, and there should be almost no problem.
 
 
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn return_tuple() -> MyTuple {
+    MyTuple { is_foo: true, bar: 9999 }
+}
 
+#[repr(C)]
+pub struct MyTuple {
+    pub is_foo: bool,
+    pub bar: i32,
+}
+```
 
+If you want to keep the returned Struct’s state longer by returning it as a pointer, a little ingenuity is required in Rust.
 
+```rust
+#[no_mangle]
+pub extern "C" fn create_context() -> *mut Context {
+    let ctx = Box::new(Context { foo: true });
+    Box::into_raw(ctx)
+}
+
+#[no_mangle]
+pub extern "C" fn delete_context(context: *mut Context) {
+    unsafe { Box::from_raw(context) };
+}
+
+#[repr(C)]
+pub struct Context {
+    pub foo: bool,
+    pub bar: i32,
+    pub baz: u64
+}
+```
+
+```csharp
+// in C#側, receiveContext*
+var context = NativeMethods.create_context();
+
+// do something
+
+// finally, call free explicitly
+NativeMethods.delete_context(context);
+```
+
+Allocate data on the heap with Box::new and remove it from Rust’s memory management with Box::into_raw. Rust usually returns memory immediately when it goes out of scope, but since the lifetime is transferred to C# which is outside of Rust’s management, it is straightforward to remove it unsafely from Rust’s management. To release memory allocated on the Rust side, return it to Rust’s management with Box::from_raw. Then, when the scope is exited, it will perform the usual operation of returning memory, and the return will be completed.
+
+This is not a matter of difficulty because of Rust; in C#, if you want to manage pointers outside of a fixed scope, you need to use GCHandle.Alloc(obj, GCHandleType.Pinned) and manually manage it unsafely, so it’s the same story.
+
+There is a style of creating a dedicated SafeHandle in C# for managing such contexts and wrapping it, but I don’t think it’s necessary to go that far. After all, you’re doing something unsafe by crossing boundaries, so you might as well take responsibility until the end.
+
+Csbindgen will try to generate something similar on the C# side when a struct is specified as a return value, but I think there may be cases where you want to use it only within Rust and not expose the contents to the C# side, or you can’t expose it because it contains references (Box) or something. In that case, please return a c_void. Alternatively, you can use a dedicated empty struct pointer, which is better because the handle represented by the pointer is distinguished by the type.
+
+```rust
+#[no_mangle]
+pub extern "C" fn create_counter_context() -> *mut c_void {
+    let ctx = Box::new(CounterContext {
+        set: HashSet::new(),
+    });
+    Box::into_raw(ctx) as *mut c_void // return void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn insert_counter_context(context: *mut c_void, value: i32) {
+    let mut counter = Box::from_raw(context as *mut CounterContext); // type convert by as
+    counter.set.insert(value);
+    Box::into_raw(counter); // require into_raw if continue to use context
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn delete_counter_context(context: *mut c_void) {
+    let counter = Box::from_raw(context as *mut CounterContext);
+    for value in counter.set.iter() {
+        println!("counter value: {}", value)
+    }
+}
+
+// not expose to C#
+pub struct CounterContext {
+    pub set: HashSet<i32>,
+}
+```
+
+```csharp
+// in C#, receive ctx = void*
+var ctx = NativeMethods.create_counter_context();
+
+NativeMethods.insert_counter_context(ctx, 10);
+NativeMethods.insert_counter_context(ctx, 20);
+
+NativeMethods.delete_counter_context(ctx);
+```
+
+## Marshaling Strings and Arrays
 
 
 
